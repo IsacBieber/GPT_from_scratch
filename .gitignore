@@ -1,0 +1,32 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+.env
+venv/
+.venv/
+
+.DS_Store
+Thumbs.db
+
+.idea/
+.vscode/
+*.swp
+*.swo
+
+*.log
+
+# 模型权重文件（不上传到 GitHub）
+models/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# 生成的数据文件（由代码自动生成，不上传）
+data/encoded.txt
