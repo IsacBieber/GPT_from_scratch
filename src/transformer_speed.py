@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import remap
 import get_data
-import save_model  # 引入我们强大的存档系统
+import save_model
 
 # =================== 1. 硬件加速设定 ===================
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -11,7 +11,7 @@ if device == 'cuda':
     torch.set_float32_matmul_precision('high')
 print(f"🔥 当前使用的计算设备是: {device}")
 
-# =================== 2. 疯狂拉大参数 ===================
+# =================== 2. 模型超参数 ===================
 vocab_size = remap.vocab_size 
 batch_size = 64      
 seq_size = 256       
@@ -30,60 +30,58 @@ def fast_get_batch():
     y = raw_data[ix.unsqueeze(1) + offsets + 1]
     return x, y
 
-# =================== 3. 模型架构 =======================
-class Head(nn.Module):
-    def __init__(self, head_size):
+# =================== 3. 优化后的标准模型架构 =======================
+class CausalSelfAttention(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.Q = nn.Linear(embed_size, head_size, bias=False)
-        self.K = nn.Linear(embed_size, head_size, bias=False)
-        self.V = nn.Linear(embed_size, head_size, bias=False)
+        self.c_attn = nn.Linear(embed_size, 3 * embed_size, bias=False)
+        self.c_proj = nn.Linear(embed_size, embed_size)
 
     def forward(self, x):
-        q = self.Q(x) 
-        k = self.K(x) 
-        v = self.V(x) 
-        output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        return output
+        B, T, C = x.size()
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(embed_size, dim=2)
+        q = q.view(B, T, head_num, head_size).transpose(1, 2)
+        k = k.view(B, T, head_num, head_size).transpose(1, 2)
+        v = v.view(B, T, head_num, head_size).transpose(1, 2)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.c_proj(y)
 
-class MultiHeadAttention(nn.Module):
-    def __init__(self, num_heads, head_size):
+class Block(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(embed_size, embed_size) 
+        self.ln_1 = nn.LayerNorm(embed_size)
+        self.attn = CausalSelfAttention()
+        self.ln_2 = nn.LayerNorm(embed_size)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_size, 4 * embed_size),
+            nn.GELU(), 
+            nn.Linear(4 * embed_size, embed_size)
+        )
 
     def forward(self, x):
-        almost_e = torch.cat([h(x) for h in self.heads], dim=-1) 
-        final_e = self.proj(almost_e)
-        return final_e
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
 
 class GPT(nn.Module):
     def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, embed_size)
         self.position_embedding_table = nn.Embedding(seq_size, embed_size)
-        
-        self.mha = MultiHeadAttention(head_num, head_size)
-        
-        self.FFNs = nn.ModuleList([nn.Sequential(
-            nn.Linear(embed_size, 4 * embed_size),
-            nn.ReLU(),
-            nn.Linear(4 * embed_size, embed_size),
-            nn.LayerNorm(embed_size)
-        ) for _ in range(network_depth)])
-        
+        self.blocks = nn.ModuleList([Block() for _ in range(network_depth)])
+        self.ln_f = nn.LayerNorm(embed_size) 
         self.lm_head = nn.Linear(embed_size, vocab_size, bias=False)
         self.token_embedding_table.weight = self.lm_head.weight 
 
     def forward(self, idx):
         B, T = idx.size()
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device) 
-        
         x = self.token_embedding_table(idx) + self.position_embedding_table(pos)
-        x = x + self.mha(x)  
-        
-        for FFN in self.FFNs:
-            x = x + FFN(x) 
-            
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
         logits = self.lm_head(x) 
         return logits
 
@@ -91,47 +89,37 @@ gpt = GPT().to(device)
 opt = torch.optim.Adam(gpt.parameters(), lr=3e-4, fused=True) 
 
 # =================== 4. 存档挂载与训练循环 =================
-# 设定保存的文件名
 model_filename = 'gpt_shakespeare.pt'
 
-# 在开训前，尝试读取存档！
 start_epoch, best_loss = save_model.load_checkpoint(gpt, opt, filename=model_filename, device=device)
 
-# 如果你只想推理不想训练，可以把 total_epoch 改成和 start_epoch 一样大
-total_epoch = 10000 
+if device == 'cuda':
+    print("⚡ 正在编译模型，预计首次前向传播会有少许延迟...")
+    gpt = torch.compile(gpt, backend="aot_eager")
 
+total_epoch = 10000 
 print(f"\n🚀 启动狂暴训练 (目标 Epoch: {total_epoch})...")
 
-for i in range(start_epoch, total_epoch):
-    x, y = fast_get_batch()
-    
-    opt.zero_grad(set_to_none=True)
-    
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits = gpt(x) 
-        B, T, C = logits.shape
-        logits = logits.view(B*T, C)
-        y = y.view(B*T)
-        loss = F.cross_entropy(logits, y) 
-    
-    loss.backward()
-    opt.step()
+if start_epoch < total_epoch:
+    for i in range(start_epoch, total_epoch):
+        x, y = fast_get_batch()
+        opt.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits = gpt(x) 
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1)) 
+        loss.backward()
+        opt.step()
 
-    # 每 500 轮打印一次并保存模型
-    if i % 500 == 0:
-        current_loss = loss.item()
-        print(f"Epoch {i:5d} | Loss: {current_loss:.4f}")
-        
-        # 判断是不是历史最低 Loss
-        is_best = current_loss < best_loss
-        if is_best:
-            best_loss = current_loss
-            
-        # 调用存档系统
-        save_model.save_checkpoint(gpt, opt, i, current_loss, is_best, filename=model_filename)
-
-# 跑完了最后再强制保存一次
-save_model.save_checkpoint(gpt, opt, total_epoch, loss.item(), is_best=False, filename=model_filename)
+        if i % 500 == 0:
+            current_loss = loss.item()
+            print(f"Epoch {i:5d} | Loss: {current_loss:.4f}")
+            is_best = current_loss < best_loss
+            if is_best:
+                best_loss = current_loss
+            save_model.save_checkpoint(gpt, opt, i, current_loss, is_best, filename=model_filename)
+    save_model.save_checkpoint(gpt, opt, total_epoch, loss.item(), is_best=False, filename=model_filename)
+else:
+    print(f"✅ 目标 Epoch ({total_epoch}) 已圆满达成！直接进入推理阶段...")
 
 # =================== 5. 推理部分 ===========================
 def print_words(x_list):
@@ -149,11 +137,15 @@ gpt.eval()
 with torch.no_grad():
     for _ in range(output_token):
         context_cond = context[:, -seq_size:]
-        
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             logits = gpt(context_cond)
             
         logits = logits[:, -1, :] 
+        
+        # 🌟 加回了温度控制，防止过拟合变成缝合怪！
+        temperature = 0.8  
+        logits = logits / temperature 
+        
         probs = F.softmax(logits, dim=-1)
         next_word = torch.multinomial(probs, num_samples=1)
         context = torch.cat((context, next_word), dim=1)
